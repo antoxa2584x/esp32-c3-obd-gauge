@@ -11,6 +11,9 @@ static const char* INIT_CMDS[] = {
   "ATL0",    // linefeeds off
   "ATS0",    // spaces off (compact responses)
   "ATH0",    // headers off (response = data bytes only)
+  "ATAT2",   // aggressive adaptive timing: return the instant the ECU replies
+  "ATST20",  // cap the per-request wait at ~128 ms (0x20 * 4 ms). Lower = faster
+             // refresh but risks NO DATA on slow ISO 9141-2 ECUs; raise if so.
   "ATSP0",   // auto-detect protocol
   "0100",    // probe: forces protocol negotiation ("SEARCHING...")
   "ATDPN",   // describe protocol number -> tells us CAN vs ISO9141/KWP (for DTCs)
@@ -113,7 +116,8 @@ void ObdClient::toFailed(const char* why) {
   _stamp = millis();
 }
 
-void ObdClient::requestDtcScan()  { _dtcScanReq = true;  _dtcReady = false; }
+void ObdClient::requestDtcScan()  { _dtcScanReq = true;  _dtcReady = false;
+                                    _dtcProbed = false; _dtcTry = 0; }
 void ObdClient::requestDtcClear() { _dtcClearReq = true; _dtcReady = false; }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,7 @@ void ObdClient::loop() {
     case ObdState::TCP_CONNECTING:
       _client.setTimeout(OBD_TCP_TIMEOUT / 1000);
       if (_client.connect(OBD_HOST, OBD_PORT)) {
+        _client.setNoDelay(true);      // disable Nagle: send each tiny command at once
         _state = ObdState::INITIALIZING;
         _initStep = 0;
         _awaiting = false;
@@ -168,13 +173,32 @@ void ObdClient::loop() {
 
     case ObdState::DTC_SCAN:
       if (!_client.connected()) { toFailed("dropped"); break; }
+      // Step 1: re-read the protocol number. Auto-detect (ATSP0) can settle late
+      // and mode-03 framing differs (CAN prepends a DTC-count byte, ISO 9141-2 /
+      // KWP do not) -- a stale _isCan mis-parses ISO 9141-2 codes.
+      if (!_dtcProbed) {
+        if (!_awaiting) { sendCmd("ATDPN"); }
+        else if (pumpResponse() || millis() - _cmdSentAt > OBD_RSP_TIMEOUT) {
+          if (_rsp.length()) detectProtocol(_rsp);
+          _awaiting = false;
+          _dtcProbed = true;
+        }
+        break;
+      }
+      // Step 2: request stored codes. ISO 9141-2's slow 5-baud bus frequently
+      // returns NO DATA on the first post-init request, so retry a few times.
       if (!_awaiting) { sendCmd("03"); }
       else if (pumpResponse()) {
         parseDtc(_rsp);
+        _awaiting = false;
+        bool blank = _dtcCodes.empty() && isNoise(clean(_rsp));
+        if (blank && _dtcTry < 2) { _dtcTry++; break; }   // wake the bus, try again
         _dtcReady = true;
         _state = ObdState::READY;
       } else if (millis() - _cmdSentAt > OBD_RSP_TIMEOUT) {
-        _dtcCodes.clear(); _dtcReady = true; _awaiting = false;
+        _awaiting = false;
+        if (_dtcTry < 2) { _dtcTry++; break; }            // retry on timeout too
+        _dtcCodes.clear(); _dtcReady = true;
         _state = ObdState::READY;
       }
       break;

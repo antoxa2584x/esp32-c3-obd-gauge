@@ -57,12 +57,31 @@ static bool     s_scanning = false;      // WiFi scan in progress
 static uint32_t s_lastRefresh = 0;
 
 // boot splash + auto-connect
-static bool     s_bootDone   = false;
-static uint32_t s_bootStart  = 0;
-static bool     s_scanDone   = false;    // a WiFi scan has finished
-static bool     s_savedFound = false;    // saved SSID was seen in that scan
+static bool     s_bootDone     = false;
+static uint32_t s_bootStart    = 0;
+static bool     s_scanDone     = false;  // a WiFi scan has finished
+static bool     s_savedFound   = false;  // saved SSID was seen in that scan
+static bool     s_reconnecting = false;  // splash shown as an idle "waiting to reconnect" screen
+static bool     s_bootTapToPick = false; // user tapped the splash -> open the WiFi picker
+static uint32_t s_connLostSince = 0;     // millis since the OBD link went (or stayed) down
+static uint32_t s_pickActivity = 0;      // last touch on the WiFi picker (for the idle timeout)
 #define BOOT_MIN_MS   2400               // minimum splash time
 #define BOOT_MAX_MS   6000               // don't wait past this for the scan
+#define CONN_LOST_MS  25000              // no OBD link for this long -> fall back to the idle splash
+#define PICK_IDLE_MS  30000              // no tap / no pick on the WiFi screen -> idle splash
+
+// Gauge smoothing: the raw PIDs update in coarse steps at 10 Hz, which makes the
+// arcs jump. We ease a float toward each latest reading every frame so the
+// needles glide. Targets are set by the 10 Hz refresh; the ease block drives the
+// arcs + value labels. (volt targets are in decivolts, like the arc range.)
+static float    s_rpmDisp   = 0.0f;  static int s_rpmTarget  = 0;
+static float    s_tempDisp  = 0.0f;  static int s_tempTarget = 0;   // native degC
+static float    s_voltDisp  = 0.0f;  static int s_voltTarget = 0;   // decivolts
+static uint32_t s_lastEase  = 0;
+
+// screen-switch animation guard (ignore swipes until the transition finishes)
+#define SCR_ANIM_MS   250
+static uint32_t s_scrBusyUntil = 0;
 
 // checkered-flag splash geometry (kept modest: tiles are LVGL objects and this
 // board's LVGL heap is small; the whole splash is freed after boot).
@@ -70,6 +89,15 @@ static bool     s_savedFound = false;    // saved SSID was seen in that scan
 #define FLAG_ROWS  6
 #define FLAG_CELL  48
 static lv_obj_t* s_flagTiles[FLAG_ROWS][FLAG_COLS];
+// the "OBD/Dash" wordmark (8 outline copies + 1 fill): shown on first boot,
+// hidden when the splash is reused as a text-free idle / reconnect screen.
+static lv_obj_t* s_bootText[9];
+static int       s_nBootText = 0;
+static void boot_set_text(bool show) {
+  for (int i = 0; i < s_nBootText; i++)
+    show ? lv_obj_clear_flag(s_bootText[i], LV_OBJ_FLAG_HIDDEN)
+         : lv_obj_add_flag(s_bootText[i], LV_OBJ_FLAG_HIDDEN);
+}
 
 // collect themable text labels so we can recolor on theme switch
 static lv_obj_t* s_textLabels[24]; static int s_nText = 0;
@@ -172,7 +200,10 @@ static void ev_demo(lv_event_t* e) {
 
 static void ui_start_scan();          // fwd decl
 
-static void ev_rescan(lv_event_t* e) { ui_start_scan(); }
+// any touch on the WiFi picker keeps the idle timeout at bay
+static void ev_pick_activity(lv_event_t* e) { s_pickActivity = millis(); }
+
+static void ev_rescan(lv_event_t* e) { s_pickActivity = millis(); ui_start_scan(); }
 
 static void ev_pick_net(lv_event_t* e) {
   lv_obj_t* btn = lv_event_get_target(e);
@@ -347,8 +378,17 @@ static void update_temp_warn(int coolant) {
 }
 
 // ---- screen navigation (swipe-driven) -------------------------------------
-static void go_prev() { s_scr = (s_scr + SCREEN_COUNT - 1) % SCREEN_COUNT; lv_scr_load(s_screens[s_scr]); }
-static void go_next() { s_scr = (s_scr + 1) % SCREEN_COUNT; lv_scr_load(s_screens[s_scr]); }
+// Slide the incoming screen in from the swipe direction. A short lockout keeps
+// a fast second swipe from stacking transitions (LVGL asserts on overlapping
+// screen-load anims).
+static void go_to(int idx, lv_scr_load_anim_t anim) {
+  if (millis() < s_scrBusyUntil) return;
+  s_scr = idx;
+  s_scrBusyUntil = millis() + SCR_ANIM_MS;
+  lv_scr_load_anim(s_screens[s_scr], anim, SCR_ANIM_MS, 0, false);
+}
+static void go_prev() { go_to((s_scr + SCREEN_COUNT - 1) % SCREEN_COUNT, LV_SCR_LOAD_ANIM_MOVE_RIGHT); }
+static void go_next() { go_to((s_scr + 1) % SCREEN_COUNT, LV_SCR_LOAD_ANIM_MOVE_LEFT); }
 
 // change backlight, persist, and flash a small popup
 static void adjust_brightness(int delta) {
@@ -381,9 +421,19 @@ static void ev_gesture(lv_event_t* e) {
 // ---------------------------------------------------------------------------
 //  boot splash: a waving checkered flag behind centered "OBD / Dash"
 // ---------------------------------------------------------------------------
+// Tapping the splash (during boot OR while it's up as an idle reconnect screen)
+// jumps straight to the WiFi picker. ui_tick() acts on the flag so the screen
+// load happens on the main path, not inside the input callback.
+static void ev_boot_tap(lv_event_t* e) {
+  if (s_bootDone) return;         // only meaningful while the splash is showing
+  s_bootTapToPick = true;
+}
+
 static void build_boot() {
   s_boot = lv_obj_create(NULL);
   lv_obj_clear_flag(s_boot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_boot, LV_OBJ_FLAG_CLICKABLE);   // tap -> WiFi picker
+  lv_obj_add_event_cb(s_boot, ev_boot_tap, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_pad_all(s_boot, 0, 0);
   lv_obj_set_style_border_width(s_boot, 0, 0);
   lv_obj_set_style_bg_color(s_boot, lv_color_black(), 0);
@@ -412,6 +462,7 @@ static void build_boot() {
   const int OFF = 3;
   const int dx[8] = { -OFF, 0, OFF, -OFF, OFF, -OFF, 0, OFF };
   const int dy[8] = { -OFF, -OFF, -OFF, 0, 0, OFF, OFF, OFF };
+  s_nBootText = 0;
   for (int k = 0; k < 8; k++) {
     lv_obj_t* o = lv_label_create(s_boot);
     lv_label_set_text(o, "OBD\nDash");
@@ -419,6 +470,7 @@ static void build_boot() {
     lv_obj_set_style_text_color(o, lv_color_black(), 0);
     lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(o, LV_ALIGN_CENTER, dx[k], dy[k]);
+    s_bootText[s_nBootText++] = o;
   }
 
   lv_obj_t* wm = lv_label_create(s_boot);
@@ -427,6 +479,7 @@ static void build_boot() {
   lv_obj_set_style_text_color(wm, lv_color_white(), 0);
   lv_obj_set_style_text_align(wm, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(wm, LV_ALIGN_CENTER, 0, 0);
+  s_bootText[s_nBootText++] = wm;
 }
 
 // Ripple the flag columns each frame (fixed at the left "mast", free on the right).
@@ -452,9 +505,11 @@ static void boot_anim_tick() {
 static void build_pick() {
   s_pick = lv_obj_create(NULL);
   lv_obj_clear_flag(s_pick, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_pick, LV_OBJ_FLAG_CLICKABLE);                    // catch taps on empty area
+  lv_obj_add_event_cb(s_pick, ev_pick_activity, LV_EVENT_PRESSED, NULL);
 
   lv_obj_t* ttl = lv_label_create(s_pick);
-  lv_label_set_text(ttl, "SELECT OBD WIFI");
+  lv_label_set_text(ttl, "OBD WIFI");
   lv_obj_set_style_text_font(ttl, &lv_font_montserrat_16, 0);
   lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 22);
   reg_dim(ttl);
@@ -462,6 +517,7 @@ static void build_pick() {
   pick_list = lv_list_create(s_pick);
   lv_obj_set_size(pick_list, 192, 116);
   lv_obj_align(pick_list, LV_ALIGN_CENTER, 0, -4);
+  lv_obj_add_event_cb(pick_list, ev_pick_activity, LV_EVENT_PRESSED, NULL);   // scrolling counts too
 
   pick_status = lv_label_create(s_pick);
   lv_label_set_text(pick_status, "");
@@ -470,12 +526,16 @@ static void build_pick() {
   reg_dim(pick_status);
 
   lv_obj_t* br = lv_btn_create(s_pick);      // rescan
+  lv_obj_set_size(br, 46, 46);
+  lv_obj_set_style_radius(br, 23, 0);
   lv_obj_align(br, LV_ALIGN_BOTTOM_MID, -44, -12);
   lv_obj_t* brl = lv_label_create(br);
   lv_label_set_text(brl, LV_SYMBOL_REFRESH); lv_obj_center(brl);
   lv_obj_add_event_cb(br, ev_rescan, LV_EVENT_CLICKED, NULL);
 
   lv_obj_t* bd = lv_btn_create(s_pick);      // demo
+  lv_obj_set_size(bd, 46, 46);
+  lv_obj_set_style_radius(bd, 23, 0);
   lv_obj_align(bd, LV_ALIGN_BOTTOM_MID, 44, -12);
   lv_obj_t* bdl = lv_label_create(bd);
   lv_label_set_text(bdl, LV_SYMBOL_EYE_OPEN); lv_obj_center(bdl);
@@ -530,7 +590,7 @@ static void build_main() {
   t_rpm = new_screen(); s_screens[0] = t_rpm;
   arc_rpm = make_gauge(t_rpm, 0, settings.rpmMax, &lbl_rpm);
   ttl_rpm = lv_label_create(t_rpm);
-  lv_label_set_text(ttl_rpm, "ENGINE RPM");
+  lv_label_set_text(ttl_rpm, "RPM");
   lv_obj_set_style_text_font(ttl_rpm, &lv_font_montserrat_14, 0);
   lv_obj_align(ttl_rpm, LV_ALIGN_CENTER, 0, -42);
   reg_dim(ttl_rpm);
@@ -544,7 +604,7 @@ static void build_main() {
   t_temp = new_screen(); s_screens[1] = t_temp;
   arc_temp = make_gauge(t_temp, TEMP_MIN_C, TEMP_MAX_C, &lbl_temp);
   ttl_temp = lv_label_create(t_temp);
-  lv_label_set_text(ttl_temp, "COOLANT");
+  lv_label_set_text(ttl_temp, "TEMP");
   lv_obj_set_style_text_font(ttl_temp, &lv_font_montserrat_14, 0);
   lv_obj_align(ttl_temp, LV_ALIGN_CENTER, 0, -42);
   reg_dim(ttl_temp);
@@ -554,14 +614,14 @@ static void build_main() {
   t_volt = new_screen(); s_screens[2] = t_volt;
   arc_volt = make_gauge(t_volt, 80, 160, &lbl_volt);   // decivolts: 8.0 .. 16.0 V (font 48, like the other gauges)
   ttl_volt = lv_label_create(t_volt);
-  lv_label_set_text(ttl_volt, "BATTERY");
+  lv_label_set_text(ttl_volt, "VOLTAGE");
   lv_obj_set_style_text_font(ttl_volt, &lv_font_montserrat_14, 0);
   lv_obj_align(ttl_volt, LV_ALIGN_CENTER, 0, -42);
   reg_dim(ttl_volt);
 
   // --- screen 3: Errors ---
   t_err = new_screen(); s_screens[3] = t_err;
-  ttl_err = make_title(t_err, "TROUBLE CODES");
+  ttl_err = make_title(t_err, "ERROR CODES");
   btn_scan = lv_btn_create(t_err);
   lv_obj_align(btn_scan, LV_ALIGN_TOP_MID, 0, 58);
   lv_obj_t* bl = lv_label_create(btn_scan); lv_label_set_text(bl, LV_SYMBOL_REFRESH " Scan");
@@ -573,13 +633,13 @@ static void build_main() {
   lv_obj_align(err_list, LV_ALIGN_CENTER, 0, 18);
 
   err_status = lv_label_create(t_err);
-  lv_label_set_text(err_status, "Tap Scan to read codes");
+  lv_label_set_text(err_status, "Tap Scan");
   lv_obj_set_style_text_font(err_status, &lv_font_montserrat_14, 0);
   lv_obj_align(err_status, LV_ALIGN_CENTER, 0, 18);
   reg_dim(err_status);
 
   btn_clear = lv_btn_create(t_err);
-  lv_obj_align(btn_clear, LV_ALIGN_BOTTOM_MID, 0, -34);
+  lv_obj_align(btn_clear, LV_ALIGN_BOTTOM_MID, 0, -18);
   lv_obj_t* cl = lv_label_create(btn_clear); lv_label_set_text(cl, LV_SYMBOL_TRASH " Clear");
   lv_obj_center(cl);
   lv_obj_add_event_cb(btn_clear, ev_clear, LV_EVENT_CLICKED, NULL);
@@ -627,7 +687,9 @@ void ui_init() {
 
   // Show the splash and start scanning immediately, so by the time the logo
   // clears we already know whether the last-used adapter is in range.
-  s_bootStart = millis();
+  boot_set_text(true);            // branded wordmark on the very first boot
+  s_bootStart    = millis();
+  s_pickActivity = millis();
   lv_scr_load(s_boot);
   ui_start_scan();
 }
@@ -705,9 +767,38 @@ void ui_tick() {
   }
 
   // Boot splash: animate the flag, then either auto-connect to the last-used
-  // adapter (if it's in range) or fall back to the network picker.
+  // adapter (if it's in range) or fall back to the network picker. The same
+  // splash is reused as an idle "reconnecting" screen after a link outage.
   if (!s_bootDone) {
     boot_anim_tick();
+
+    // Tapped -> let the user choose a network right away.
+    if (s_bootTapToPick) {
+      s_bootTapToPick = false;
+      s_bootDone      = true;
+      s_reconnecting  = false;
+      s_pickActivity  = millis();
+      lv_scr_load_anim(s_pick, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
+      ui_start_scan();
+      return;
+    }
+
+    // Idle reconnect splash: obd auto-retries in the background, so just keep
+    // waving the flag and jump to the gauges the moment the link returns.
+    if (s_reconnecting) {
+      if (obd.ready()) {
+        s_bootDone      = true;
+        s_reconnecting  = false;
+        s_mainShown     = true;
+        s_connLostSince = 0;
+        s_scr = 0;
+        lv_scr_load(s_screens[0]);
+      }
+      return;
+    }
+
+    // First boot: hold the logo, then auto-connect or show the picker. (auto_del
+    // is false now -- the splash is kept so it can be reshown on a link outage.)
     uint32_t el = millis() - s_bootStart;
     bool ready = s_scanDone || el >= BOOT_MAX_MS;   // don't wait forever
     if (el >= BOOT_MIN_MS && ready) {
@@ -716,12 +807,46 @@ void ui_tick() {
         lv_label_set_text(c_ssid, settings.ssid.c_str());
         lv_label_set_text(c_status, "Connecting...");
         obd.begin();                                // join the saved adapter
-        lv_scr_load_anim(s_connect, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, true);
+        lv_scr_load_anim(s_connect, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
       } else {
-        lv_scr_load_anim(s_pick, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, true);
+        s_pickActivity = millis();
+        lv_scr_load_anim(s_pick, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
       }
     }
     return;   // nothing else runs while the splash is up
+  }
+
+  // WiFi picker idle timeout: no tap and no network picked for PICK_IDLE_MS ->
+  // drop to the text-free idle splash (tapping it brings the picker back).
+  if (lv_scr_act() == s_pick && millis() - s_pickActivity > PICK_IDLE_MS) {
+    boot_set_text(false);
+    s_bootDone      = false;
+    s_reconnecting  = true;
+    s_bootStart     = millis();
+    s_connLostSince = 0;
+    lv_scr_load_anim(s_boot, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
+    return;
+  }
+
+  // Link-health watchdog: once a connection attempt is underway, a long outage
+  // drops back to the animated splash (which doubles as a reconnect screen).
+  // Disarmed while the picker is up (governed above), obd IDLE, or in demo.
+  if (!s_demo && lv_scr_act() != s_pick) {
+    if (obd.ready() || obd.state() == ObdState::IDLE) {
+      s_connLostSince = 0;
+    } else {
+      if (s_connLostSince == 0) s_connLostSince = millis();
+      if (millis() - s_connLostSince > CONN_LOST_MS) {
+        boot_set_text(false);
+        s_mainShown     = false;
+        s_bootDone      = false;
+        s_reconnecting  = true;
+        s_bootStart     = millis();
+        s_connLostSince = 0;
+        lv_scr_load_anim(s_boot, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, false);
+        return;
+      }
+    }
   }
 
   // screen switching
@@ -750,6 +875,34 @@ void ui_tick() {
     }
   }
 
+  // Ease every gauge toward its latest reading every ~16 ms -- independent of the
+  // 10 Hz value refresh below -- so the arcs glide instead of stepping.
+  if (arc_rpm && millis() - s_lastEase >= 16) {
+    s_lastEase = millis();
+    const float K = 0.22f;   // per-frame approach fraction
+
+    s_rpmDisp += (s_rpmTarget - s_rpmDisp) * K;
+    if (fabsf(s_rpmTarget - s_rpmDisp) < 1.0f) s_rpmDisp = s_rpmTarget;   // settle
+    int r = (int)(s_rpmDisp + 0.5f);
+    lv_arc_set_value(arc_rpm, r);
+    lv_obj_set_style_arc_color(arc_rpm, rpm_zone_color(r, settings.rpmMax), LV_PART_INDICATOR);
+    lv_label_set_text_fmt(lbl_rpm, "%d", r);
+
+    s_tempDisp += (s_tempTarget - s_tempDisp) * K;
+    if (fabsf(s_tempTarget - s_tempDisp) < 1.0f) s_tempDisp = s_tempTarget;
+    int tc = (int)(s_tempDisp + 0.5f);
+    lv_arc_set_value(arc_temp, tc);
+    lv_label_set_text_fmt(lbl_temp, "%d%s", (int)temp_display(tc), temp_unit());
+
+    s_voltDisp += (s_voltTarget - s_voltDisp) * K;
+    if (fabsf(s_voltTarget - s_voltDisp) < 1.0f) s_voltDisp = s_voltTarget;
+    int dv = (int)(s_voltDisp + 0.5f);
+    lv_arc_set_value(arc_volt, dv);
+    lv_obj_set_style_arc_color(arc_volt, volt_zone_color(dv / 10.0f), LV_PART_INDICATOR);
+    if (s_voltTarget > 5) lv_label_set_text_fmt(lbl_volt, "%d.%dV", dv / 10, dv % 10);
+    else                  lv_label_set_text(lbl_volt, "--");
+  }
+
   // throttle live value refresh to ~10 Hz
   if (millis() - s_lastRefresh < 100) return;
   s_lastRefresh = millis();
@@ -768,21 +921,13 @@ void ui_tick() {
     rpm = obd.rpm; coolant = obd.coolantC; speed = obd.speedKmh; volt = obd.voltage;
   }
 
-  lv_arc_set_value(arc_rpm, rpm);
-  lv_obj_set_style_arc_color(arc_rpm, rpm_zone_color(rpm, settings.rpmMax), LV_PART_INDICATOR);
-  lv_label_set_text_fmt(lbl_rpm, "%d", rpm);
+  // Hand the latest readings to the ease block above (it drives the arcs+labels).
+  s_rpmTarget  = rpm;
+  s_tempTarget = coolant;
+  s_voltTarget = (int)(volt * 10.0f + 0.5f);   // decivolts (LVGL's printf has no %f)
+
   lv_label_set_text_fmt(lbl_speed, "%d %s", (int)speed_display(speed), speed_unit());
-
-  lv_arc_set_value(arc_temp, coolant);
-  lv_label_set_text_fmt(lbl_temp, "%d%s", (int)temp_display(coolant), temp_unit());
-
-  update_temp_warn(coolant);   // flash / solid overheat overlay
-
-  int dvolt = (int)(volt * 10.0f + 0.5f);   // decivolts (LVGL's printf has no %f)
-  lv_arc_set_value(arc_volt, dvolt);
-  lv_obj_set_style_arc_color(arc_volt, volt_zone_color(volt), LV_PART_INDICATOR);
-  if (volt > 0.5f) lv_label_set_text_fmt(lbl_volt, "%d.%dV", dvolt / 10, dvolt % 10);
-  else             lv_label_set_text(lbl_volt, "--");
+  update_temp_warn(coolant);   // flash / solid overheat overlay (live value, not eased)
 
   lv_label_set_text(set_conn, s_demo ? (LV_SYMBOL_EYE_OPEN " Demo mode")
                      : obd.ready() ? (LV_SYMBOL_WIFI " Connected")
