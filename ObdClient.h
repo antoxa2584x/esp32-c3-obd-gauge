@@ -68,6 +68,8 @@ class ObdClient {
   bool _dtcScanReq  = false;
   bool _dtcClearReq = false;
   bool _dtcReady    = false;
+  bool _dtcProbed   = false;   // re-queried ATDPN at scan start (framing depends on it)
+  uint8_t _dtcTry   = 0;       // mode-03 attempts (slow ISO 9141-2 often NO-DATAs first)
   std::vector<String> _dtcCodes;
 
   void   sendCmd(const char* cmd);
