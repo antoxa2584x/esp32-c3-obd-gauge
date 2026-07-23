@@ -9,9 +9,11 @@
 #include "config.h"
 
 // ---- screen / widget handles ---------------------------------------------
+static lv_obj_t* s_boot;     // startup splash (animated checkered flag)
 static lv_obj_t* s_pick;     // WiFi network picker
 static lv_obj_t* s_connect;
-static lv_obj_t* s_screens[4];   // 0=RPM 1=Temp 2=Errors 3=Settings
+static lv_obj_t* s_screens[5];   // 0=RPM 1=Temp 2=Volt 3=Errors 4=Settings
+static const int SCREEN_COUNT = 5;
 static int       s_scr = 0;
 
 static lv_obj_t* bright_toast;         // brief "Brightness NN%" popup
@@ -29,6 +31,7 @@ static lv_obj_t* c_demo;     // demo button
 // gauge tiles
 static lv_obj_t* t_rpm;  static lv_obj_t* arc_rpm;  static lv_obj_t* lbl_rpm;  static lv_obj_t* lbl_speed;  static lv_obj_t* ttl_rpm;
 static lv_obj_t* t_temp; static lv_obj_t* arc_temp; static lv_obj_t* lbl_temp; static lv_obj_t* ttl_temp;
+static lv_obj_t* t_volt; static lv_obj_t* arc_volt; static lv_obj_t* lbl_volt; static lv_obj_t* ttl_volt;
 
 // error tile
 static lv_obj_t* t_err;  static lv_obj_t* err_list; static lv_obj_t* err_status; static lv_obj_t* ttl_err;
@@ -52,6 +55,21 @@ static bool     s_dtcWaiting = false;
 static bool     s_demo = false;          // true = simulate data, no real OBD
 static bool     s_scanning = false;      // WiFi scan in progress
 static uint32_t s_lastRefresh = 0;
+
+// boot splash + auto-connect
+static bool     s_bootDone   = false;
+static uint32_t s_bootStart  = 0;
+static bool     s_scanDone   = false;    // a WiFi scan has finished
+static bool     s_savedFound = false;    // saved SSID was seen in that scan
+#define BOOT_MIN_MS   2400               // minimum splash time
+#define BOOT_MAX_MS   6000               // don't wait past this for the scan
+
+// checkered-flag splash geometry (kept modest: tiles are LVGL objects and this
+// board's LVGL heap is small; the whole splash is freed after boot).
+#define FLAG_COLS  6
+#define FLAG_ROWS  6
+#define FLAG_CELL  48
+static lv_obj_t* s_flagTiles[FLAG_ROWS][FLAG_COLS];
 
 // collect themable text labels so we can recolor on theme switch
 static lv_obj_t* s_textLabels[24]; static int s_nText = 0;
@@ -102,6 +120,13 @@ static lv_color_t rpm_zone_color(int rpm, int maxr) {
   if (f >= 0.88f) return th_danger();
   if (f >= 0.70f) return th_temp();
   return th_ok();
+}
+
+// Battery voltage color: red when flat/overcharging, green while charging.
+static lv_color_t volt_zone_color(float v) {
+  if (v < 11.8f || v > 14.8f) return th_danger();   // discharged / overcharge
+  if (v >= 13.0f)             return th_ok();        // alternator charging
+  return th_temp();                                  // resting / low-ish
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +180,7 @@ static void ev_pick_net(lv_event_t* e) {
   if (!ssid || !ssid[0]) return;
   settings.ssid = ssid;
   settings.pass = OBD_WIFI_PASS;   // "" = open (typical); set in config.h if secured
+  settings.wifiConfigured = true;  // remember it -> auto-connect on next boot
   settings_save();
   lv_label_set_text(c_ssid, settings.ssid.c_str());
   obd.begin();                     // start joining the chosen adapter
@@ -321,8 +347,8 @@ static void update_temp_warn(int coolant) {
 }
 
 // ---- screen navigation (swipe-driven) -------------------------------------
-static void go_prev() { s_scr = (s_scr + 3) % 4; lv_scr_load(s_screens[s_scr]); }
-static void go_next() { s_scr = (s_scr + 1) % 4; lv_scr_load(s_screens[s_scr]); }
+static void go_prev() { s_scr = (s_scr + SCREEN_COUNT - 1) % SCREEN_COUNT; lv_scr_load(s_screens[s_scr]); }
+static void go_next() { s_scr = (s_scr + 1) % SCREEN_COUNT; lv_scr_load(s_screens[s_scr]); }
 
 // change backlight, persist, and flash a small popup
 static void adjust_brightness(int delta) {
@@ -350,6 +376,74 @@ static void ev_gesture(lv_event_t* e) {
   else if (d == LV_DIR_RIGHT)  go_prev();
   else if (d == LV_DIR_TOP)    adjust_brightness(+15);   // swipe up -> brighter
   else if (d == LV_DIR_BOTTOM) adjust_brightness(-15);   // swipe down -> dimmer
+}
+
+// ---------------------------------------------------------------------------
+//  boot splash: a waving checkered flag behind centered "OBD / Dash"
+// ---------------------------------------------------------------------------
+static void build_boot() {
+  s_boot = lv_obj_create(NULL);
+  lv_obj_clear_flag(s_boot, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_all(s_boot, 0, 0);
+  lv_obj_set_style_border_width(s_boot, 0, 0);
+  lv_obj_set_style_bg_color(s_boot, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(s_boot, LV_OPA_COVER, 0);
+
+  // grid of tiles (a little larger than the screen so the wave never bares gaps)
+  const int startX = (SCREEN_W - FLAG_COLS * FLAG_CELL) / 2;
+  const int startY = (SCREEN_H - FLAG_ROWS * FLAG_CELL) / 2;
+  for (int r = 0; r < FLAG_ROWS; r++) {
+    for (int c = 0; c < FLAG_COLS; c++) {
+      lv_obj_t* tile = lv_obj_create(s_boot);
+      lv_obj_remove_style_all(tile);
+      lv_obj_set_size(tile, FLAG_CELL, FLAG_CELL);
+      lv_obj_set_pos(tile, startX + c * FLAG_CELL, startY + r * FLAG_CELL);
+      lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+      lv_obj_set_style_bg_color(tile,
+          ((r + c) & 1) ? lv_color_white() : lv_color_black(), 0);
+      s_flagTiles[r][c] = tile;
+    }
+  }
+
+  // Wordmark with a black outline so it stays legible over the checker.
+  // LVGL has no text stroke, so draw black copies offset in 8 directions
+  // behind the white text.
+  const int OFF = 3;
+  const int dx[8] = { -OFF, 0, OFF, -OFF, OFF, -OFF, 0, OFF };
+  const int dy[8] = { -OFF, -OFF, -OFF, 0, 0, OFF, OFF, OFF };
+  for (int k = 0; k < 8; k++) {
+    lv_obj_t* o = lv_label_create(s_boot);
+    lv_label_set_text(o, "OBD\nDash");
+    lv_obj_set_style_text_font(o, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(o, lv_color_black(), 0);
+    lv_obj_set_style_text_align(o, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(o, LV_ALIGN_CENTER, dx[k], dy[k]);
+  }
+
+  lv_obj_t* wm = lv_label_create(s_boot);
+  lv_label_set_text(wm, "OBD\nDash");
+  lv_obj_set_style_text_font(wm, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(wm, lv_color_white(), 0);
+  lv_obj_set_style_text_align(wm, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(wm, LV_ALIGN_CENTER, 0, 0);
+}
+
+// Ripple the flag columns each frame (fixed at the left "mast", free on the right).
+static void boot_anim_tick() {
+  if (s_bootDone || !s_boot) return;
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last < 33) return;           // ~30 fps
+  last = now;
+  const int startY = (SCREEN_H - FLAG_ROWS * FLAG_CELL) / 2;
+  float t = (now - s_bootStart) / 1000.0f;
+  for (int c = 0; c < FLAG_COLS; c++) {
+    float amp = 12.0f * (float)c / (FLAG_COLS - 1);     // 0 at mast -> max at fly
+    int   dy  = (int)(amp * sinf(t * 4.5f - c * 0.7f));
+    for (int r = 0; r < FLAG_ROWS; r++)
+      lv_obj_set_y(s_flagTiles[r][c], startY + r * FLAG_CELL + dy);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,8 +550,17 @@ static void build_main() {
   reg_dim(ttl_temp);
   build_warn(t_temp);   // overheat overlay on this screen (below the buttons)
 
-  // --- screen 2: Errors ---
-  t_err = new_screen(); s_screens[2] = t_err;
+  // --- screen 2: Battery voltage ---
+  t_volt = new_screen(); s_screens[2] = t_volt;
+  arc_volt = make_gauge(t_volt, 80, 160, &lbl_volt);   // decivolts: 8.0 .. 16.0 V (font 48, like the other gauges)
+  ttl_volt = lv_label_create(t_volt);
+  lv_label_set_text(ttl_volt, "BATTERY");
+  lv_obj_set_style_text_font(ttl_volt, &lv_font_montserrat_14, 0);
+  lv_obj_align(ttl_volt, LV_ALIGN_CENTER, 0, -42);
+  reg_dim(ttl_volt);
+
+  // --- screen 3: Errors ---
+  t_err = new_screen(); s_screens[3] = t_err;
   ttl_err = make_title(t_err, "TROUBLE CODES");
   btn_scan = lv_btn_create(t_err);
   lv_obj_align(btn_scan, LV_ALIGN_TOP_MID, 0, 58);
@@ -481,8 +584,8 @@ static void build_main() {
   lv_obj_center(cl);
   lv_obj_add_event_cb(btn_clear, ev_clear, LV_EVENT_CLICKED, NULL);
 
-  // --- screen 3: Settings ---
-  t_set = new_screen(); s_screens[3] = t_set;
+  // --- screen 4: Settings ---
+  t_set = new_screen(); s_screens[4] = t_set;
   ttl_set = make_title(t_set, "SETTINGS");
 
   lbl_theme = lv_label_create(t_set);
@@ -514,13 +617,18 @@ static void build_main() {
 
 // ---------------------------------------------------------------------------
 void ui_init() {
+  build_boot();
   build_pick();
   build_connect();
   build_main();
   build_bright();
   ui_apply_theme();
   display_backlight(settings.brightness);   // apply saved brightness
-  lv_scr_load(s_pick);
+
+  // Show the splash and start scanning immediately, so by the time the logo
+  // clears we already know whether the last-used adapter is in range.
+  s_bootStart = millis();
+  lv_scr_load(s_boot);
   ui_start_scan();
 }
 
@@ -528,7 +636,7 @@ void ui_init() {
 void ui_apply_theme() {
   theme_apply(display_lv_disp());
 
-  lv_obj_t* bgs[] = { s_pick, s_connect, t_rpm, t_temp, t_err, t_set };
+  lv_obj_t* bgs[] = { s_pick, s_connect, t_rpm, t_temp, t_volt, t_err, t_set };
   for (auto o : bgs) if (o) {
     lv_obj_set_style_bg_color(o, th_bg(), 0);
     lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
@@ -545,6 +653,10 @@ void ui_apply_theme() {
   if (arc_temp) {
     lv_obj_set_style_arc_color(arc_temp, th_track(), LV_PART_MAIN);
     lv_obj_set_style_arc_color(arc_temp, th_temp(),  LV_PART_INDICATOR);
+  }
+  if (arc_volt) {
+    lv_obj_set_style_arc_color(arc_volt, th_track(), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc_volt, th_ok(),    LV_PART_INDICATOR);
   }
   // spinner accent
   if (c_spin) lv_obj_set_style_arc_color(c_spin, th_accent(), LV_PART_INDICATOR);
@@ -569,6 +681,8 @@ void ui_tick() {
     int n = WiFi.scanComplete();
     if (n >= 0) {
       s_scanning = false;
+      s_scanDone = true;
+      s_savedFound = false;
       lv_obj_clean(pick_list);
       if (n == 0) {
         lv_label_set_text(pick_status, "No networks - tap " LV_SYMBOL_REFRESH);
@@ -577,6 +691,7 @@ void ui_tick() {
         for (int i = 0; i < n; i++) {
           String ss = WiFi.SSID(i);
           if (ss.length() == 0) continue;
+          if (ss == settings.ssid) s_savedFound = true;
           lv_obj_t* b = lv_list_add_btn(pick_list, LV_SYMBOL_WIFI, ss.c_str());
           lv_obj_add_event_cb(b, ev_pick_net, LV_EVENT_CLICKED, NULL);
         }
@@ -584,8 +699,29 @@ void ui_tick() {
       WiFi.scanDelete();
     } else if (n == WIFI_SCAN_FAILED) {
       s_scanning = false;
+      s_scanDone = true;
       lv_label_set_text(pick_status, "Scan failed - tap " LV_SYMBOL_REFRESH);
     }
+  }
+
+  // Boot splash: animate the flag, then either auto-connect to the last-used
+  // adapter (if it's in range) or fall back to the network picker.
+  if (!s_bootDone) {
+    boot_anim_tick();
+    uint32_t el = millis() - s_bootStart;
+    bool ready = s_scanDone || el >= BOOT_MAX_MS;   // don't wait forever
+    if (el >= BOOT_MIN_MS && ready) {
+      s_bootDone = true;
+      if (settings.wifiConfigured && s_savedFound) {
+        lv_label_set_text(c_ssid, settings.ssid.c_str());
+        lv_label_set_text(c_status, "Connecting...");
+        obd.begin();                                // join the saved adapter
+        lv_scr_load_anim(s_connect, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, true);
+      } else {
+        lv_scr_load_anim(s_pick, LV_SCR_LOAD_ANIM_FADE_ON, 300, 0, true);
+      }
+    }
+    return;   // nothing else runs while the splash is up
   }
 
   // screen switching
@@ -619,6 +755,7 @@ void ui_tick() {
   s_lastRefresh = millis();
 
   int rpm, coolant, speed;
+  float volt;
   if (s_demo) {                                   // synthetic sweeps
     float ph = millis() / 1000.0f;
     rpm     = (int)(1500 + (sinf(ph * 1.7f) * 0.5f + 0.5f) * 4500);   // 1500..6000
@@ -626,8 +763,9 @@ void ui_tick() {
     uint32_t warm = millis() / 600;                                   // warm-up ramp
     // ramp to ~105 then oscillate +/-12 so it crosses a ~110 warning for the demo
     coolant = 40 + (int)(warm > 65 ? 65 : warm) + (int)(sinf(ph) * 12);
+    volt    = 13.8f + sinf(ph * 0.4f) * 0.6f;                         // ~13.2..14.4 V
   } else {
-    rpm = obd.rpm; coolant = obd.coolantC; speed = obd.speedKmh;
+    rpm = obd.rpm; coolant = obd.coolantC; speed = obd.speedKmh; volt = obd.voltage;
   }
 
   lv_arc_set_value(arc_rpm, rpm);
@@ -639,6 +777,12 @@ void ui_tick() {
   lv_label_set_text_fmt(lbl_temp, "%d%s", (int)temp_display(coolant), temp_unit());
 
   update_temp_warn(coolant);   // flash / solid overheat overlay
+
+  int dvolt = (int)(volt * 10.0f + 0.5f);   // decivolts (LVGL's printf has no %f)
+  lv_arc_set_value(arc_volt, dvolt);
+  lv_obj_set_style_arc_color(arc_volt, volt_zone_color(volt), LV_PART_INDICATOR);
+  if (volt > 0.5f) lv_label_set_text_fmt(lbl_volt, "%d.%dV", dvolt / 10, dvolt % 10);
+  else             lv_label_set_text(lbl_volt, "--");
 
   lv_label_set_text(set_conn, s_demo ? (LV_SYMBOL_EYE_OPEN " Demo mode")
                      : obd.ready() ? (LV_SYMBOL_WIFI " Connected")

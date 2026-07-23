@@ -13,11 +13,26 @@ static const char* INIT_CMDS[] = {
   "ATH0",    // headers off (response = data bytes only)
   "ATSP0",   // auto-detect protocol
   "0100",    // probe: forces protocol negotiation ("SEARCHING...")
+  "ATDPN",   // describe protocol number -> tells us CAN vs ISO9141/KWP (for DTCs)
 };
 static const uint8_t INIT_COUNT = sizeof(INIT_CMDS) / sizeof(INIT_CMDS[0]);
 
-// Live PIDs polled round-robin while READY.
-static const char* POLL_PIDS[] = { "010C", "0105", "010D", "0111" };
+// Live commands polled round-robin while READY. Weighted, not uniform: RPM
+// changes fastest so it gets half the slots; coolant/throttle/voltage barely
+// move, so they're sampled once per cycle. "ATRV" reads the adapter's
+// battery-voltage sense (works even before the vehicle protocol is detected).
+static const char* POLL_PIDS[] = {
+  "010C",  // RPM
+  "010D",  // speed
+  "010C",  // RPM
+  "0105",  // coolant temp
+  "010C",  // RPM
+  "010D",  // speed
+  "010C",  // RPM
+  "0111",  // throttle
+  "010C",  // RPM
+  "ATRV",  // battery voltage
+};
 static const uint8_t POLL_COUNT = sizeof(POLL_PIDS) / sizeof(POLL_PIDS[0]);
 
 // --- helpers ---------------------------------------------------------------
@@ -135,7 +150,9 @@ void ObdClient::loop() {
         sendCmd(INIT_CMDS[_initStep]);
       } else {
         // ATZ and the 0100 probe can be slow; be lenient and advance anyway.
-        if (pumpResponse() || millis() - _cmdSentAt > OBD_RSP_TIMEOUT) {
+        bool got = pumpResponse();
+        if (got || millis() - _cmdSentAt > OBD_RSP_TIMEOUT) {
+          if (got && strcmp(INIT_CMDS[_initStep], "ATDPN") == 0) detectProtocol(_rsp);
           _awaiting = false;
           _initStep++;
         }
@@ -184,7 +201,8 @@ void ObdClient::handleReady() {
     if (millis() - _lastPoll < OBD_POLL_INTERVAL) return;
     sendCmd(POLL_PIDS[_pollIdx]);
   } else if (pumpResponse()) {
-    parseLivePid(_rsp);
+    if (POLL_PIDS[_pollIdx][0] == 'A') parseVoltage(_rsp);   // "ATRV"
+    else                               parseLivePid(_rsp);
     _awaiting = false;
     _pollIdx = (_pollIdx + 1) % POLL_COUNT;
     _lastPoll = millis();
@@ -211,26 +229,75 @@ void ObdClient::parseLivePid(const String& raw) {
     throttle = hexByte(s, i + 4) * 100 / 255;
 }
 
-// Decode mode-03 response into SAE codes (e.g. "P0301").
+// ATRV replies with the sense voltage, e.g. "12.3V".  NOTE: don't run this
+// through clean() -- that strips the '.' and mangles the value.
+void ObdClient::parseVoltage(const String& raw) {
+  String s = raw;
+  s.replace("\r", ""); s.replace("\n", ""); s.replace(" ", "");
+  s.toUpperCase();
+  if (isNoise(s)) return;
+  s.replace("V", "");                       // "12.3V" -> "12.3"
+  float v = s.toFloat();
+  if (v > 4.0f && v < 20.0f) voltage = v;   // sanity gate
+}
+
+// ATDPN reply is the protocol number (e.g. "A6" auto/CAN, "3" ISO9141).
+// Protocols 6..C are CAN (ISO 15765 / J1939); 1..5 are PWM/VPW/ISO9141/KWP.
+void ObdClient::detectProtocol(const String& raw) {
+  String s = clean(raw);
+  if (isNoise(s) || s.length() == 0) return;
+  char n = s[s.length() - 1];              // trailing digit is the protocol #
+  _isCan = (n >= '6' && n <= '9') || (n >= 'A' && n <= 'C');
+}
+
+// Decode a mode-03 response into SAE codes (e.g. "P0301").
+//
+// ELM327 quirks handled here:
+//  - CAN inserts a DTC-count byte right after 0x43; ISO 9141/KWP do not
+//    (we know which from ATDPN -> _isCan).
+//  - Multi-frame CAN prints a length line ("014") and frame-indexed lines
+//    ("0:...","1:...") even with headers off -> reassemble those into one msg.
+//  - ISO 9141/KWP send one "43..." line per ECU/message -> parse each.
 void ObdClient::parseDtc(const String& raw) {
   _dtcCodes.clear();
-  String s = clean(raw);
-  if (isNoise(s)) return;
-  int i = s.indexOf("43");
-  if (i < 0) return;
+
+  // Split on '\r' (ATL0 = no '\n'). Merge ISO-TP frames ("0:","1:") into one
+  // buffer; every other non-noise line is an independent message.
+  std::vector<String> msgs;
+  String canBuf;
+  bool multi = false;
+  int start = 0;
+  while (start < (int)raw.length()) {
+    int nl = raw.indexOf('\r', start);
+    String line = (nl < 0) ? raw.substring(start) : raw.substring(start, nl);
+    start = (nl < 0) ? raw.length() : nl + 1;
+    line = clean(line);
+    if (line.length() == 0 || isNoise(line)) continue;
+    int colon = line.indexOf(':');               // "0:" / "1:" frame index
+    if (colon >= 0 && colon <= 1) { multi = true; canBuf += line.substring(colon + 1); }
+    else                            msgs.push_back(line);
+  }
+  if (multi) msgs.push_back(canBuf);
+
   const char CAT[] = { 'P', 'C', 'B', 'U' };
-  int p = i + 2;
-  while (p + 4 <= (int)s.length()) {          // need 4 hex chars = one DTC
-    uint8_t A = hexByte(s, p), B = hexByte(s, p + 2);
-    p += 4;
-    if (A == 0 && B == 0) continue;                    // padding / no code
-    char buf[6];
-    buf[0] = CAT[(A & 0xC0) >> 6];
-    buf[1] = '0' + ((A & 0x30) >> 4);
-    buf[2] = "0123456789ABCDEF"[A & 0x0F];
-    buf[3] = "0123456789ABCDEF"[(B & 0xF0) >> 4];
-    buf[4] = "0123456789ABCDEF"[B & 0x0F];
-    buf[5] = 0;
-    _dtcCodes.push_back(String(buf));
+  for (uint16_t m = 0; m < msgs.size(); m++) {
+    const String& hex = msgs[m];
+    int i = hex.indexOf("43");
+    if (i < 0) continue;                          // e.g. the "014" length line
+    int p = i + 2;
+    if (_isCan) p += 2;                            // skip the CAN DTC-count byte
+    while (p + 4 <= (int)hex.length()) {          // 4 hex chars = one DTC
+      uint8_t A = hexByte(hex, p), B = hexByte(hex, p + 2);
+      p += 4;
+      if (A == 0 && B == 0) continue;                    // padding / no code
+      char buf[6];
+      buf[0] = CAT[(A & 0xC0) >> 6];
+      buf[1] = '0' + ((A & 0x30) >> 4);
+      buf[2] = "0123456789ABCDEF"[A & 0x0F];
+      buf[3] = "0123456789ABCDEF"[(B & 0xF0) >> 4];
+      buf[4] = "0123456789ABCDEF"[B & 0x0F];
+      buf[5] = 0;
+      _dtcCodes.push_back(String(buf));
+    }
   }
 }

@@ -14,6 +14,7 @@ void settings_load() {
   settings.brightness = prefs.getInt("bri", 70);
   settings.ssid      = prefs.getString("ssid", OBD_WIFI_SSID);
   settings.pass      = prefs.getString("pass", OBD_WIFI_PASS);
+  settings.wifiConfigured = prefs.getBool("wcfg", false);
   prefs.end();
 }
 
@@ -26,6 +27,7 @@ void settings_save() {
   prefs.putInt("bri", settings.brightness);
   prefs.putString("ssid", settings.ssid);
   prefs.putString("pass", settings.pass);
+  prefs.putBool("wcfg", settings.wifiConfigured);
   prefs.end();
 }
 

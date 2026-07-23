@@ -12,6 +12,7 @@ struct AppSettings {
   int    brightness = 70;    // backlight %  (10..100)
   String ssid;               // chosen OBD adapter SSID
   String pass;               // its password ("" = open)
+  bool   wifiConfigured = false;  // true once a network was picked -> auto-connect on boot
 };
 
 extern AppSettings settings;

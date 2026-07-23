@@ -35,6 +35,7 @@ class ObdClient {
   int   coolantC  = 0;
   int   speedKmh  = 0;
   int   throttle  = 0;   // %
+  float voltage   = 0.0f;   // adapter battery voltage (V), from ATRV
 
   // DTC (Diagnostic Trouble Code) support
   void  requestDtcScan();
@@ -57,6 +58,7 @@ class ObdClient {
 
   // init handshake progress
   uint8_t  _initStep  = 0;
+  bool     _isCan     = true;    // CAN inserts a DTC-count byte in mode 03 (ATDPN)
 
   // live poll round-robin
   uint8_t  _pollIdx   = 0;
@@ -72,7 +74,9 @@ class ObdClient {
   bool   pumpResponse();                 // returns true when '>' received
   void   handleReady();
   void   parseLivePid(const String& r);
+  void   parseVoltage(const String& r);
   void   parseDtc(const String& r);
+  void   detectProtocol(const String& r);   // sets _isCan from ATDPN reply
   void   toFailed(const char* why);
 };
 
