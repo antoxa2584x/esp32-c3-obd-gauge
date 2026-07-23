@@ -20,7 +20,9 @@
 #define OBD_WIFI_TIMEOUT   15000              // give up joining AP after this
 #define OBD_TCP_TIMEOUT    8000               // socket connect timeout
 #define OBD_RSP_TIMEOUT    5000               // wait for '>' after a command
-#define OBD_POLL_INTERVAL  60                 // ms between live PID polls
+#define OBD_POLL_INTERVAL  10                 // ms idle between polls (we already
+                                              // wait for the '>' prompt, so this
+                                              // just avoids hammering the adapter)
 
 // ---------------------------------------------------------------------------
 //  Display (GC9A01) SPI pins

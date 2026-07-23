@@ -3,7 +3,9 @@
 //  Board : ESP32-2424S012 (ESP32-C3 + GC9A01 240x240 round + CST816D touch)
 //  Link  : ELM327 WiFi V1.5 (PIC18F25K80) @ 192.168.0.10:35000
 //
-//  Screens: connect  ->  swipe between  RPM | Coolant | Trouble codes | Settings
+//  Boot: animated checkered-flag splash -> auto-connect to the last-used
+//        adapter if in range, else the WiFi picker.
+//  Screens: swipe between  RPM | Coolant | Battery | Trouble codes | Settings
 //  Features: dark/light theme, metric/imperial units (persisted to NVS).
 //
 //  Everything runs single-threaded in loop() -- the ESP32-C3 has one core and

@@ -8,12 +8,21 @@ round GC9A01 240×240 IPS + CST816 capacitive touch) that talks to an
 
 | Screen | What it shows |
 |--------|---------------|
-| **WiFi picker** | Scans for networks at boot; pick your adapter's SSID (or **Demo**) |
+| **Boot splash** | Animated waving checkered-flag logo ("OBD / Dash") while it scans |
+| **WiFi picker** | Pick your adapter's SSID (or **Demo**). Only shown when the last-used adapter isn't found |
 | **Connect** | Live status while joining the adapter and initializing OBD |
 | **RPM** | Engine RPM arc gauge (green→amber→red zones) + speed readout |
 | **Coolant** | Coolant temperature arc gauge + overheat warning overlay |
+| **Battery** | Adapter/battery voltage arc gauge (via `ATRV`); red when flat/overcharging |
 | **Trouble Codes** | Scan (mode 03) and clear (mode 04) stored DTCs |
 | **Settings** | Dark/light theme + metric/imperial units (saved to flash) |
+
+## Boot & auto-connect
+
+On power-up the gauge shows a brief animated checkered-flag splash while it
+scans for WiFi networks. If the **last-used adapter** is in range it connects
+straight to it; the network picker only appears on the very first run or when
+that adapter isn't found. Your choice is remembered in flash.
 
 ## Controls (touch)
 
@@ -125,7 +134,7 @@ DTCs). No adapter needed. Alternatively point it at a PC running
 - **Touch dead / breaks after idle:** should be fixed by the direct CST816 driver + auto-sleep off; confirm touch pins (SDA=4, SCL=5, RST=1, addr 0x15). If mirrored, flip X/Y in `touch_cb`.
 - **Stuck on "Joining adapter WiFi...":** wrong SSID/password, or the adapter isn't powered (ignition on).
 - **Values stay `--`:** vehicle protocol not detected — the first probe can take several seconds; a cheap clone may only support a few PIDs.
-- **Garbled DTCs:** multi-frame CAN responses aren't fully reassembled; the parser handles the common single-frame case. Verify against a proper scanner before acting on codes.
+- **Garbled DTCs:** the parser handles single-frame CAN (including the DTC-count byte) and ISO 9141/KWP, and strips multi-frame line prefixes best-effort. Very long multi-frame CAN responses may still not fully reassemble — verify against a proper scanner before acting on codes.
 
 ## Notes & limits
 

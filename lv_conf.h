@@ -16,8 +16,10 @@
 #define LV_COLOR_16_SWAP    0        // byte-swap done in the flush callback
 
 // --- Memory (no PSRAM on ESP32-C3; keep modest) ---
+// 64 KB leaves headroom for the extra voltage screen + the boot-splash tiles
+// (the splash is freed once boot finishes).
 #define LV_MEM_CUSTOM       0
-#define LV_MEM_SIZE         (48U * 1024U)
+#define LV_MEM_SIZE         (64U * 1024U)
 
 // --- Tick: we call lv_tick_inc() ourselves from display_tick() ---
 #define LV_TICK_CUSTOM      0
